@@ -90,15 +90,23 @@ func ConnectGormDB(config *DatabaseConfig) (*gorm.DB, error) {
 	// Only run migration if environment variable is set
 	if os.Getenv("RUN_MIGRATION") == "true" {
 		slog.Info("Running GORM auto-migration for V1 models")
-		err = db.AutoMigrate(
-			&models.Member{},
-			&models.Schema{},
-			&models.SchemaSubmission{},
-			&models.Application{},
-			&models.ApplicationSubmission{},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to run auto-migration: %w", err)
+		// To avoid issues with GORM creating foreign keys before referenced tables exist,
+		// we migrate the models individually in strict dependency order.
+		orderedModels := []struct {
+			name  string
+			model interface{}
+		}{
+			{"Member", &models.Member{}},
+			{"Schema", &models.Schema{}},
+			{"Application", &models.Application{}},
+			{"SchemaSubmission", &models.SchemaSubmission{}},
+			{"ApplicationSubmission", &models.ApplicationSubmission{}},
+		}
+
+		for _, m := range orderedModels {
+			if err = db.AutoMigrate(m.model); err != nil {
+				return nil, fmt.Errorf("failed to run auto-migration for %s: %w", m.name, err)
+			}
 		}
 		slog.Info("GORM auto-migration completed successfully")
 	} else {

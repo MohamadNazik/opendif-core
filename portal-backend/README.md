@@ -36,6 +36,8 @@ DB_PORT=5432
 DB_USERNAME=postgres
 DB_PASSWORD=your_password
 DB_NAME=portal_backend
+DB_SSLMODE=disable
+RUN_MIGRATION=true
 
 # JWT Authentication (Required)
 IDP_BASE_URL=https://api.asgardeo.io/t/your-org
