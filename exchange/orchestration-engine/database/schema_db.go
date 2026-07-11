@@ -76,6 +76,11 @@ func (s *SchemaDB) createTables() error {
 		return fmt.Errorf("failed to create schema_versions table: %w", err)
 	}
 
+	// Create async requests tables
+	if err := s.createAsyncTables(); err != nil {
+		return fmt.Errorf("failed to create async tables: %w", err)
+	}
+
 	return nil
 }
 

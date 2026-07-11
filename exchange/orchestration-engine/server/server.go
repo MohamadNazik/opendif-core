@@ -109,6 +109,9 @@ func SetupRouter(f *federator.Federator) *chi.Mux {
 
 	// Set the schema service in the federator
 	f.SchemaService = schemaService
+	if schemaDB != nil {
+		f.Db = schemaDB
+	}
 	// /health route
 	mux.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -132,6 +135,11 @@ func SetupRouter(f *federator.Federator) *chi.Mux {
 
 	// Handle activation endpoint with proper path matching
 	mux.Post("/sdl/versions/{version}/activate", schemaHandler.ActivateSchema)
+
+	// Async request endpoints
+	mux.Post("/public/graphql/async", f.SubmitAsyncQuery)
+	mux.Get("/public/graphql/async/{transactionId}", f.PollAsyncQueryStatus)
+	mux.Post("/api/v1/callback", f.ReceiveProviderCallback)
 
 	// Publicly accessible Endpoints
 	mux.Post("/public/graphql", func(w http.ResponseWriter, r *http.Request) {

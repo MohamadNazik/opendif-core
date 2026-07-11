@@ -16,6 +16,7 @@ import (
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/auth"
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/configs"
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/consent"
+	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/database"
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/internals/errors"
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/logger"
 	"github.com/ginaxu1/gov-dx-sandbox/exchange/orchestration-engine/middleware"
@@ -38,6 +39,7 @@ type Federator struct {
 	Schema          *ast.Document
 	SchemaService   interface{}          // Will be *services.SchemaService, using interface{} to avoid circular import
 	TokenValidator  *auth.TokenValidator // Cached validator for JWT token signature verification
+	Db              *database.SchemaDB   // Database connection for async queries
 }
 
 type FederationServiceAST struct {
