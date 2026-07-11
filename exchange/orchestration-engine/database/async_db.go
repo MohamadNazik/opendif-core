@@ -111,18 +111,42 @@ func (s *SchemaDB) UpdateProviderResponse(txID, providerKey string, payload []by
 	return nil
 }
 
-// GetPendingProviderResponsesCount returns the count of provider responses that are still pending
-func (s *SchemaDB) GetPendingProviderResponsesCount(txID string) (int, error) {
-	query := `
-		SELECT COUNT(*) FROM async_provider_responses
-		WHERE transaction_id = $1 AND status = 'pending'`
-
-	var count int
-	err := s.db.QueryRow(query, txID).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get pending provider responses count: %w", err)
+// FailProviderResponse marks a single provider's response as failed, recording the error.
+// The error is stored in the payload column as a JSON error object so it can be
+// surfaced when the overall request is later reported as failed.
+func (s *SchemaDB) FailProviderResponse(txID, providerKey, errMsg string) error {
+	errPayload, marshalErr := json.Marshal(map[string]string{"error": errMsg})
+	if marshalErr != nil {
+		errPayload = []byte(`{"error":"unknown error"}`)
 	}
-	return count, nil
+
+	query := `
+		UPDATE async_provider_responses
+		SET status = 'failed', payload = $1, updated_at = NOW()
+		WHERE transaction_id = $2 AND provider_key = $3`
+
+	_, err := s.db.Exec(query, errPayload, txID, providerKey)
+	if err != nil {
+		return fmt.Errorf("failed to mark provider response as failed: %w", err)
+	}
+	return nil
+}
+
+// GetProviderResponseStatusCounts returns the number of provider responses for a
+// transaction that are still pending and the number that have failed.
+func (s *SchemaDB) GetProviderResponseStatusCounts(txID string) (pending int, failed int, err error) {
+	query := `
+		SELECT
+			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+			COUNT(*) FILTER (WHERE status = 'failed') AS failed
+		FROM async_provider_responses
+		WHERE transaction_id = $1`
+
+	err = s.db.QueryRow(query, txID).Scan(&pending, &failed)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get provider response status counts: %w", err)
+	}
+	return pending, failed, nil
 }
 
 // GetAllProviderResponses retrieves all completed responses for a transaction
@@ -152,32 +176,47 @@ func (s *SchemaDB) GetAllProviderResponses(txID string) ([]AsyncProviderResponse
 	return responses, nil
 }
 
-// CompleteAsyncRequest updates the main async request status to completed and sets the aggregated payload
-func (s *SchemaDB) CompleteAsyncRequest(txID string, combinedPayload []byte) error {
+// CompleteAsyncRequest updates the main async request status to completed and sets the
+// aggregated payload, but only if the request is still 'pending'. It returns applied=true
+// if this call actually performed the transition, and false if the request had already been
+// finalized (completed or failed) by another goroutine - callers should treat false as a
+// no-op rather than an error.
+func (s *SchemaDB) CompleteAsyncRequest(txID string, combinedPayload []byte) (applied bool, err error) {
 	query := `
 		UPDATE async_requests
 		SET status = 'completed', combined_payload = $1, updated_at = NOW()
-		WHERE transaction_id = $2`
+		WHERE transaction_id = $2 AND status = 'pending'`
 
-	_, err := s.db.Exec(query, combinedPayload, txID)
+	result, err := s.db.Exec(query, combinedPayload, txID)
 	if err != nil {
-		return fmt.Errorf("failed to complete async request: %w", err)
+		return false, fmt.Errorf("failed to complete async request: %w", err)
 	}
-	return nil
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to determine rows affected completing async request: %w", err)
+	}
+	return rowsAffected > 0, nil
 }
 
-// FailAsyncRequest updates the main async request status to failed and sets the error message
-func (s *SchemaDB) FailAsyncRequest(txID string, errMsg string) error {
+// FailAsyncRequest updates the main async request status to failed and sets the error
+// message, but only if the request is still 'pending'. It returns applied=true if this call
+// actually performed the transition, and false if the request had already been finalized by
+// another goroutine.
+func (s *SchemaDB) FailAsyncRequest(txID string, errMsg string) (applied bool, err error) {
 	query := `
 		UPDATE async_requests
 		SET status = 'failed', error_message = $1, updated_at = NOW()
-		WHERE transaction_id = $2`
+		WHERE transaction_id = $2 AND status = 'pending'`
 
-	_, err := s.db.Exec(query, errMsg, txID)
+	result, err := s.db.Exec(query, errMsg, txID)
 	if err != nil {
-		return fmt.Errorf("failed to fail async request: %w", err)
+		return false, fmt.Errorf("failed to fail async request: %w", err)
 	}
-	return nil
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to determine rows affected failing async request: %w", err)
+	}
+	return rowsAffected > 0, nil
 }
 
 // GetAsyncRequest retrieves an async request by its transaction ID

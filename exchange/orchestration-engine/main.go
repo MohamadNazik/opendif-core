@@ -40,6 +40,12 @@ func main() {
 	if apiKey == "" {
 		apiKey = os.Getenv("ARGUS_AUTH_TOKEN")
 	}
+
+	// Allow environment variable override for the externally-reachable base URL
+	// used to build provider callback URLs for the async request-reply flow.
+	if envPublicURL := os.Getenv("OE_PUBLIC_URL"); envPublicURL != "" {
+		config.Server.PublicBaseURL = envPublicURL
+	}
 	auditClient := audit.NewClient(audit.Config{
 		BaseURL: config.AuditConfig.ServiceURL,
 		APIKey:  apiKey,

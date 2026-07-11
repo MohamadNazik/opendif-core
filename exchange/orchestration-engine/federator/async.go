@@ -255,31 +255,48 @@ func (f *Federator) SubmitAsyncQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For each sub-query, insert provider response record and trigger async fetch
+	// First pass: resolve every provider and insert its (pending) response row.
+	// This must complete for ALL providers before any background fetch is started,
+	// otherwise a fast provider could finish and see an incomplete row set, making
+	// GetProviderResponseStatusCounts() report "nothing pending" prematurely.
+	type resolvedProvider struct {
+		splitReq *federationServiceRequest
+		provider *provider.Provider
+	}
+	resolved := make([]resolvedProvider, 0, len(splitRequests))
 	for _, splitReq := range splitRequests {
-		err = f.Db.CreateProviderResponse(txID, splitReq.ServiceKey, splitReq.SchemaID)
-		if err != nil {
-			logger.Log.Error("Failed to create provider response in DB", "error", err)
-			f.Db.FailAsyncRequest(txID, err.Error())
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
 		p, exists := f.ProviderHandler.GetProvider(splitReq.ServiceKey, splitReq.SchemaID)
 		if !exists {
 			logger.Log.Warn("Provider not found for async request", "providerKey", splitReq.ServiceKey)
-			f.Db.FailAsyncRequest(txID, fmt.Sprintf("provider %s not found", splitReq.ServiceKey))
+			if _, failErr := f.Db.FailAsyncRequest(txID, fmt.Sprintf("provider %s not found", splitReq.ServiceKey)); failErr != nil {
+				logger.Log.Error("Failed to mark async request as failed", "error", failErr)
+			}
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
+		if err = f.Db.CreateProviderResponse(txID, splitReq.ServiceKey, splitReq.SchemaID); err != nil {
+			logger.Log.Error("Failed to create provider response in DB", "error", err)
+			if _, failErr := f.Db.FailAsyncRequest(txID, err.Error()); failErr != nil {
+				logger.Log.Error("Failed to mark async request as failed", "error", failErr)
+			}
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		resolved = append(resolved, resolvedProvider{splitReq: splitReq, provider: p})
+	}
+
+	// Second pass: now that every provider row exists, it's safe to start the
+	// background fetches - none of them can observe an incomplete row set.
+	traceID := monitoring.GetTraceIDFromContext(r.Context())
+	for _, rp := range resolved {
 		// Run background fetch using context.Background() so it outlives the client request
 		bgCtx := context.Background()
-		traceID := monitoring.GetTraceIDFromContext(r.Context())
 		if traceID != "" {
 			bgCtx = monitoring.WithTraceID(bgCtx, traceID)
 		}
-		go f.fetchProviderAsync(bgCtx, txID, splitReq, p)
+		go f.fetchProviderAsync(bgCtx, txID, rp.splitReq, rp.provider)
 	}
 
 	// Respond with 202 Accepted
@@ -327,16 +344,27 @@ func (f *Federator) getActiveSchemaFromService() (*ast.Document, error) {
 	return nil, nil
 }
 
+// asyncCallbackFallbackBaseURL is only used when no public base URL is configured
+// (e.g. local development), so the async flow still works out of the box.
+const asyncCallbackFallbackBaseURL = "http://localhost:4000"
+
 // fetchProviderAsync executes query request to provider in background
 func (f *Federator) fetchProviderAsync(ctx context.Context, txID string, req *federationServiceRequest, prov *provider.Provider) {
 	reqBody, err := json.Marshal(req.GraphQLRequest)
 	if err != nil {
 		logger.Log.Error("Failed to marshal request for provider", "provider", req.ServiceKey, "error", err)
+		f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, fmt.Sprintf("failed to marshal provider request: %v", err))
 		return
 	}
 
-	// Construct callback URL
-	callbackURL := fmt.Sprintf("http://localhost:4000/api/v1/callback?transactionId=%s&providerKey=%s", txID, req.ServiceKey)
+	// Construct callback URL using the configured public base URL for this OE instance
+	// so providers running outside this machine (staging/prod) can reach it.
+	callbackBaseURL := f.Configs.Server.PublicBaseURL
+	if callbackBaseURL == "" {
+		logger.Log.Warn("Server.PublicBaseURL is not configured; falling back to localhost callback URL, which will not be reachable outside local development", "provider", req.ServiceKey)
+		callbackBaseURL = asyncCallbackFallbackBaseURL
+	}
+	callbackURL := fmt.Sprintf("%s/api/v1/callback?transactionId=%s&providerKey=%s", strings.TrimSuffix(callbackBaseURL, "/"), txID, req.ServiceKey)
 
 	providerURL := prov.ServiceUrl
 	if strings.Contains(providerURL, "?") {
@@ -348,6 +376,7 @@ func (f *Federator) fetchProviderAsync(ctx context.Context, txID string, req *fe
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", providerURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		logger.Log.Error("Failed to create provider request", "provider", req.ServiceKey, "error", err)
+		f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, fmt.Sprintf("failed to create provider request: %v", err))
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -381,9 +410,20 @@ func (f *Federator) fetchProviderAsync(ctx context.Context, txID string, req *fe
 
 	if err != nil {
 		logger.Log.Error("Async request failed to provider", "provider", req.ServiceKey, "error", err)
+		f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, fmt.Sprintf("request to provider failed: %v", err))
 		return
 	}
 	defer resp.Body.Close()
+
+	// A non-2xx status means the provider rejected or failed the request outright - it will
+	// never call back for this transaction, so fail this provider's response now instead of
+	// leaving it pending forever.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Log.Error("Provider returned non-success status for async request", "provider", req.ServiceKey, "status", resp.StatusCode, "body", string(body))
+		f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, fmt.Sprintf("provider returned status %d", resp.StatusCode))
+		return
+	}
 
 	// If provider returns 200 OK, parse the body to check if it returned the data payload synchronously.
 	// This fallback ensures compatibility with synchronous mock providers out of the box.
@@ -391,6 +431,7 @@ func (f *Federator) fetchProviderAsync(ctx context.Context, txID string, req *fe
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			logger.Log.Error("Failed to read response body from provider", "provider", req.ServiceKey, "error", err)
+			f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, fmt.Sprintf("failed to read provider response body: %v", err))
 			return
 		}
 
@@ -399,8 +440,16 @@ func (f *Federator) fetchProviderAsync(ctx context.Context, txID string, req *fe
 			if _, hasData := check["data"]; hasData {
 				logger.Log.Info("Received synchronous response from provider in async query, processing directly", "provider", req.ServiceKey)
 				f.updateProviderResponseAndCheckCompletion(txID, req.ServiceKey, body)
+				return
+			}
+			if _, hasErrors := check["errors"]; hasErrors {
+				logger.Log.Error("Provider returned a synchronous error response for async request", "provider", req.ServiceKey)
+				f.failProviderResponseAndCheckCompletion(txID, req.ServiceKey, "provider returned a synchronous error response")
+				return
 			}
 		}
+		// Body has neither "data" nor "errors" (e.g. a bare acknowledgement) - the provider is
+		// expected to deliver the real result later via the callback URL.
 	}
 }
 
@@ -417,16 +466,50 @@ func (f *Federator) updateProviderResponseAndCheckCompletion(txID, providerKey s
 		return
 	}
 
-	pendingCount, err := f.Db.GetPendingProviderResponsesCount(txID)
-	if err != nil {
-		logger.Log.Error("Failed to get pending responses count", "transactionId", txID, "error", err)
+	f.checkTransactionCompletion(txID)
+}
+
+// failProviderResponseAndCheckCompletion marks a single provider's response as failed and,
+// once no provider responses remain pending, finalizes the overall transaction as failed so
+// clients polling for status don't wait forever on a provider that will never call back.
+func (f *Federator) failProviderResponseAndCheckCompletion(txID, providerKey, errMsg string) {
+	if f.Db == nil {
+		logger.Log.Error("Database not available to save provider response failure")
 		return
 	}
 
-	if pendingCount == 0 {
-		logger.Log.Info("All providers completed for transaction. Merging payloads...", "transactionId", txID)
-		f.aggregateAndCompleteRequest(txID)
+	if err := f.Db.FailProviderResponse(txID, providerKey, errMsg); err != nil {
+		logger.Log.Error("Failed to mark provider response as failed in DB", "transactionId", txID, "providerKey", providerKey, "error", err)
+		return
 	}
+
+	f.checkTransactionCompletion(txID)
+}
+
+// checkTransactionCompletion checks whether every provider response for a transaction has
+// resolved (completed or failed) and, if so, finalizes the transaction: as failed if any
+// provider failed, otherwise by aggregating all provider payloads.
+func (f *Federator) checkTransactionCompletion(txID string) {
+	pending, failed, err := f.Db.GetProviderResponseStatusCounts(txID)
+	if err != nil {
+		logger.Log.Error("Failed to get provider response status counts", "transactionId", txID, "error", err)
+		return
+	}
+
+	if pending > 0 {
+		return
+	}
+
+	if failed > 0 {
+		logger.Log.Warn("One or more providers failed for transaction, failing request", "transactionId", txID, "failedProviders", failed)
+		if _, err := f.Db.FailAsyncRequest(txID, fmt.Sprintf("%d provider(s) failed to respond", failed)); err != nil {
+			logger.Log.Error("Failed to mark async request as failed", "transactionId", txID, "error", err)
+		}
+		return
+	}
+
+	logger.Log.Info("All providers completed for transaction. Merging payloads...", "transactionId", txID)
+	f.aggregateAndCompleteRequest(txID)
 }
 
 // aggregateAndCompleteRequest loads all provider payloads, runs federation accumulator, and writes results to DB
@@ -445,7 +528,7 @@ func (f *Federator) aggregateAndCompleteRequest(txID string) {
 	doc, err := parser.Parse(parser.ParseParams{Source: src})
 	if err != nil {
 		logger.Log.Error("Failed to parse original query", "transactionId", txID, "error", err)
-		f.Db.FailAsyncRequest(txID, fmt.Sprintf("failed to parse original query: %v", err))
+		f.failAsyncRequest(txID, fmt.Sprintf("failed to parse original query: %v", err))
 		return
 	}
 
@@ -460,7 +543,7 @@ func (f *Federator) aggregateAndCompleteRequest(txID string) {
 		schema, err = f.loadSchemaFromFile()
 		if err != nil {
 			logger.Log.Error("Failed to load schema", "transactionId", txID, "error", err)
-			f.Db.FailAsyncRequest(txID, "active schema not found")
+			f.failAsyncRequest(txID, "active schema not found")
 			return
 		}
 	}
@@ -469,7 +552,7 @@ func (f *Federator) aggregateAndCompleteRequest(txID string) {
 	schemaInfoMap, err := BuildSchemaInfoMap(schema, doc)
 	if err != nil {
 		logger.Log.Error("Failed to build schema info map", "transactionId", txID, "error", err)
-		f.Db.FailAsyncRequest(txID, fmt.Sprintf("failed to build schema info map: %v", err))
+		f.failAsyncRequest(txID, fmt.Sprintf("failed to build schema info map: %v", err))
 		return
 	}
 
@@ -478,7 +561,7 @@ func (f *Federator) aggregateAndCompleteRequest(txID string) {
 	dbResponses, err = f.Db.GetAllProviderResponses(txID)
 	if err != nil {
 		logger.Log.Error("Failed to get all provider responses from DB", "transactionId", txID, "error", err)
-		f.Db.FailAsyncRequest(txID, fmt.Sprintf("failed to load responses: %v", err))
+		f.failAsyncRequest(txID, fmt.Sprintf("failed to load responses: %v", err))
 		return
 	}
 
@@ -505,17 +588,34 @@ func (f *Federator) aggregateAndCompleteRequest(txID string) {
 	mergedPayload, err := json.Marshal(response)
 	if err != nil {
 		logger.Log.Error("Failed to marshal combined payload", "transactionId", txID, "error", err)
-		f.Db.FailAsyncRequest(txID, fmt.Sprintf("failed to marshal merged payload: %v", err))
+		f.failAsyncRequest(txID, fmt.Sprintf("failed to marshal merged payload: %v", err))
 		return
 	}
 
-	err = f.Db.CompleteAsyncRequest(txID, mergedPayload)
+	applied, err := f.Db.CompleteAsyncRequest(txID, mergedPayload)
 	if err != nil {
 		logger.Log.Error("Failed to complete async request in DB", "transactionId", txID, "error", err)
 		return
 	}
+	if !applied {
+		logger.Log.Info("Async request was already finalized by another goroutine, skipping", "transactionId", txID)
+		return
+	}
 
 	logger.Log.Info("Async query completed and stored successfully", "transactionId", txID)
+}
+
+// failAsyncRequest marks the overall async request as failed, logging if it had already
+// been finalized (completed or failed) by another goroutine.
+func (f *Federator) failAsyncRequest(txID, errMsg string) {
+	applied, err := f.Db.FailAsyncRequest(txID, errMsg)
+	if err != nil {
+		logger.Log.Error("Failed to mark async request as failed", "transactionId", txID, "error", err)
+		return
+	}
+	if !applied {
+		logger.Log.Info("Async request was already finalized by another goroutine, skipping failure", "transactionId", txID)
+	}
 }
 
 // ReceiveProviderCallback handles POST /api/v1/callback

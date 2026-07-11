@@ -46,6 +46,10 @@ type ProviderConfig struct {
 // ServerConfig holds the server-specific configuration.
 type ServerConfig struct {
 	Port string `json:"port"`
+	// PublicBaseURL is the externally-reachable base URL of this Orchestration Engine
+	// instance (e.g. "https://oe.example.gov.lk"). It is used to build callback URLs
+	// handed out to providers for the asynchronous request-reply flow.
+	PublicBaseURL string `json:"publicBaseUrl,omitempty"`
 }
 
 // LogConfig holds the logging configuration.
