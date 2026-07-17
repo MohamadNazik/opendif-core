@@ -39,11 +39,20 @@ type JWTVerifierConfig struct {
 	Issuer   string
 	Audience string
 	ClientID string
+	// SubjectClaim is the token claim whose value is the data owner's canonical
+	// UID (matched against the consent record's owner_id). It lets each identity
+	// provider declare which claim carries the UID (e.g. "sub", "email",
+	// "individual_id"). When empty it defaults to the standard OIDC "sub".
+	SubjectClaim string
 	// InsecureSkipVerify disables TLS certificate verification for the JWKS
 	// fetch. Intended only for local/dev IdPs using self-signed certs; leave
 	// false in production.
 	InsecureSkipVerify bool
 }
+
+// DefaultSubjectClaim is the token claim used to identify the data owner when
+// no SubjectClaim is configured.
+const DefaultSubjectClaim = "sub"
 
 // JWTVerifier handles JWT token verification
 type JWTVerifier struct {
@@ -268,8 +277,11 @@ func (jv *JWTVerifier) VerifyToken(tokenString string) (*jwt.Token, error) {
 	return token, nil
 }
 
-// VerifyTokenAndExtractEmail verifies the token and extracts the email claim
-func (jv *JWTVerifier) VerifyTokenAndExtractEmail(tokenString string) (string, error) {
+// VerifyTokenAndExtractSubject verifies the token and extracts the data owner's
+// canonical UID from the configured SubjectClaim (defaulting to the standard
+// OIDC "sub"). This is the identifier matched against the consent record's
+// owner_id during portal authorization.
+func (jv *JWTVerifier) VerifyTokenAndExtractSubject(tokenString string) (string, error) {
 	token, err := jv.VerifyToken(tokenString)
 	if err != nil {
 		return "", err
@@ -280,10 +292,15 @@ func (jv *JWTVerifier) VerifyTokenAndExtractEmail(tokenString string) (string, e
 		return "", fmt.Errorf("invalid token claims")
 	}
 
-	email, ok := claims["email"].(string)
-	if !ok || email == "" {
-		return "", fmt.Errorf("email claim not found or empty in token")
+	claimName := jv.config.SubjectClaim
+	if claimName == "" {
+		claimName = DefaultSubjectClaim
 	}
 
-	return email, nil
+	subject, ok := claims[claimName].(string)
+	if !ok || subject == "" {
+		return "", fmt.Errorf("subject claim %q not found or empty in token", claimName)
+	}
+
+	return subject, nil
 }

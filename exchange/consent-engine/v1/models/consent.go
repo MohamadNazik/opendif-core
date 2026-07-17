@@ -8,26 +8,27 @@ import (
 
 // ConsentRecord represents a consent record in the system
 // Business Rules:
-// - Only one record can exist with status 'pending' or 'approved' for a given (OwnerID, OwnerEmail, AppID) tuple
+// - Only one record can exist with status 'pending' or 'approved' for a given (OwnerID, AppID) tuple
 // - Multiple records can exist with status 'revoked', 'expired', or 'rejected' for the same tuple
 // - The most recently created record should have status 'pending' or 'approved' (if active)
 type ConsentRecord struct {
 	// ConsentID is the unique identifier for the consent record
 	ConsentID uuid.UUID `gorm:"column:consent_id;type:uuid;primaryKey;default:gen_random_uuid()" json:"consent_id"`
-	// OwnerID is the unique identifier for the data owner
+	// OwnerID is the single canonical identifier (UID) for the data owner.
+	// The whole system relies on this UID to identify a user; a token claim
+	// (configurable) is matched against it during portal authorization.
 	// Part of conditional unique constraint for active consents (pending/approved)
 	OwnerID string `gorm:"column:owner_id;type:varchar(255);not null;index:idx_consent_records_owner_id;index:idx_consent_records_owner_app;uniqueIndex:idx_consent_active_unique,where:status = 'pending' OR status = 'approved'" json:"owner_id"`
-	// OwnerEmail is the email address of the data owner
-	// Part of conditional unique constraint for active consents (pending/approved)
-	OwnerEmail string `gorm:"column:owner_email;type:varchar(255);not null;index:idx_consent_records_owner_email;uniqueIndex:idx_consent_active_unique,where:status = 'pending' OR status = 'approved'" json:"owner_email"`
 	// AppID is the unique identifier for the consumer application
 	// Part of conditional unique constraint for active consents (pending/approved)
 	AppID string `gorm:"column:app_id;type:varchar(255);not null;index:idx_consent_records_app_id;index:idx_consent_records_owner_app;uniqueIndex:idx_consent_active_unique,where:status = 'pending' OR status = 'approved'" json:"app_id"`
 	// AppName is the name of the consumer application
 	AppName *string `gorm:"column:app_name;type:varchar(255);" json:"app_name,omitempty"`
 	// Status is the status of the consent record: pending, approved, rejected, expired, revoked
-	// Part of conditional unique constraint for active consents (pending/approved)
-	Status string `gorm:"column:status;type:varchar(50);not null;index:idx_consent_records_status;uniqueIndex:idx_consent_active_unique,where:status = 'pending' OR status = 'approved'" json:"status"`
+	// Filters the conditional unique constraint (via its WHERE clause) but is
+	// deliberately NOT part of the index key, so a single (owner_id, app_id) can
+	// have at most one active (pending OR approved) consent.
+	Status string `gorm:"column:status;type:varchar(50);not null;index:idx_consent_records_status" json:"status"`
 	// Type is the type of consent mechanism "realtime" or "offline"
 	Type string `gorm:"column:type;type:varchar(50);not null" json:"type"`
 	// CreatedAt is the timestamp when the consent record was created
